@@ -3,7 +3,7 @@ import { toast } from "react-toastify";
 import { AppContext } from "../context/AppContext";
 
 const DocAI = () => {
-  const { token } = useContext(AppContext);
+  const { token, backendUrl } = useContext(AppContext);
 
   const [messages, setMessages] = useState([
     {
@@ -16,13 +16,14 @@ const DocAI = () => {
   const [inputValue, setInputValue] = useState("");
   const [loading, setLoading] = useState(false);
   const [streamingContent, setStreamingContent] = useState("");
+  const [sessionId, setSessionId] = useState(null);
   const messagesEndRef = useRef(null);
   const inputRef = useRef(null);
   const messagesContainerRef = useRef(null);
   const isInitialMount = useRef(true);
 
-  const API_BASE_URL =
-    import.meta.env.VITE_LANGCHAIN_URL || "http://localhost:8001";
+  const apiBaseUrl =
+    backendUrl || import.meta.env.VITE_BACKEND_URL || "http://localhost:4000";
 
   // Auto-scroll to bottom when new messages arrive (but not on initial mount)
   const scrollToBottom = () => {
@@ -65,26 +66,16 @@ const DocAI = () => {
     setStreamingContent("");
 
     try {
-      // Prepare chat history (excluding the current message)
-      const chatHistory = messages.map((msg) => ({
-        role: msg.role,
-        content: msg.content,
-      }));
-
-      const response = await fetch(`${API_BASE_URL}/booking/stream`, {
+      const response = await fetch(`${apiBaseUrl}/api/ai/chat`, {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
           Accept: "text/event-stream",
+          ...(token ? { token } : {}),
         },
         body: JSON.stringify({
-          input: {
-            input: currentInput,
-            chat_history: chatHistory,
-            user_token: token || "", // Send user authentication token
-          },
-          config: {},
-          kwargs: {},
+          message: currentInput,
+          sessionId,
         }),
       });
 
@@ -96,6 +87,8 @@ const DocAI = () => {
       const decoder = new TextDecoder();
       let accumulatedContent = "";
       let buffer = "";
+
+      let receivedError = false;
 
       while (true) {
         const { done, value } = await reader.read();
@@ -119,33 +112,16 @@ const DocAI = () => {
 
               const data = JSON.parse(jsonStr);
 
-              // LangServe streaming format handling
-              // The response comes in chunks, accumulate the content
-              let token = "";
-
-              if (typeof data === "string") {
-                token = data;
-              } else if (data.content) {
-                token = data.content;
-              } else if (data.output) {
-                token = data.output;
-              } else if (data.token) {
-                token = data.token;
-              } else if (data.ops && Array.isArray(data.ops)) {
-                // Handle operational transform format from LangChain
-                for (const op of data.ops) {
-                  if (op.op === "add" && op.value) {
-                    token +=
-                      typeof op.value === "string"
-                        ? op.value
-                        : op.value.content || "";
-                  }
-                }
-              }
-
-              if (token) {
-                accumulatedContent += token;
+              if (data.type === "session" && data.sessionId) {
+                setSessionId(data.sessionId);
+              } else if (data.type === "chunk" && data.text) {
+                accumulatedContent += data.text;
                 setStreamingContent(accumulatedContent);
+              } else if (data.type === "error") {
+                receivedError = true;
+                throw new Error(data.message || "AI server error");
+              } else if (data.type === "done") {
+                break;
               }
             } catch (parseError) {
               console.warn("Failed to parse SSE chunk:", line, parseError);
@@ -161,26 +137,28 @@ const DocAI = () => {
       }
 
       // Add the complete message to the messages array
-      const assistantMessage = {
-        role: "assistant",
-        content:
-          accumulatedContent ||
-          "I apologize, but I couldn't generate a response. Please try again.",
-        timestamp: new Date(),
-      };
+      if (!receivedError) {
+        const assistantMessage = {
+          role: "assistant",
+          content:
+            accumulatedContent ||
+            "I apologize, but I couldn't generate a response. Please try again.",
+          timestamp: new Date(),
+        };
 
-      setMessages((prev) => [...prev, assistantMessage]);
-      setStreamingContent("");
+        setMessages((prev) => [...prev, assistantMessage]);
+        setStreamingContent("");
+      }
     } catch (error) {
       console.error("Error sending message:", error);
       toast.error(
-        "Failed to get response. Please check if the AI server is running."
+        "Failed to get response from the AI service. Please try again.",
       );
 
       const errorMessage = {
         role: "assistant",
         content:
-          "⚠️ I'm sorry, I'm having trouble connecting to the AI server. Please make sure the LangChain server is running on port 8000.",
+          "⚠️ I'm sorry, I'm having trouble connecting to the AI service. Please try again in a moment.",
         timestamp: new Date(),
       };
       setMessages((prev) => [...prev, errorMessage]);
@@ -191,7 +169,23 @@ const DocAI = () => {
     }
   };
 
-  const handleClearChat = () => {
+  const handleClearChat = async () => {
+    if (sessionId) {
+      try {
+        const response = await fetch(`${apiBaseUrl}/api/ai/chat/${sessionId}`, {
+          method: "DELETE",
+        });
+
+        if (!response.ok) {
+          throw new Error("Failed to clear session");
+        }
+      } catch (error) {
+        console.error("Error clearing chat session:", error);
+        toast.error("Failed to clear chat session. Please try again.");
+      }
+    }
+
+    setSessionId(null);
     setMessages([
       {
         role: "assistant",
@@ -235,7 +229,7 @@ const DocAI = () => {
                 className="bg-gradient-to-br from-slate-900 to-slate-800 text-emerald-300 p-5 rounded-xl overflow-x-auto my-4 text-sm border border-slate-700 shadow-lg"
               >
                 <code className="font-mono">{codeBlockContent.join("\n")}</code>
-              </pre>
+              </pre>,
             );
             codeBlockContent = [];
             inCodeBlock = false;
@@ -327,7 +321,7 @@ const DocAI = () => {
                     <span className="flex-1">{formatText(item)}</span>
                   </li>
                 ))}
-              </ListTag>
+              </ListTag>,
             );
             listItems = [];
             listType = null;
@@ -366,7 +360,7 @@ const DocAI = () => {
               className="text-lg font-bold text-gray-900 mt-5 mb-3 border-b border-gray-200 pb-2"
             >
               {trimmedSection.replace(/^###\s*/, "")}
-            </h3>
+            </h3>,
           );
           return;
         }
@@ -378,7 +372,7 @@ const DocAI = () => {
               className="text-xl font-bold text-gray-900 mt-6 mb-3 border-b-2 border-blue-200 pb-2"
             >
               {trimmedSection.replace(/^##\s*/, "")}
-            </h2>
+            </h2>,
           );
           return;
         }
@@ -390,7 +384,7 @@ const DocAI = () => {
               className="text-2xl font-bold text-gray-900 mt-6 mb-4 border-b-2 border-blue-300 pb-3"
             >
               {trimmedSection.replace(/^#\s*/, "")}
-            </h1>
+            </h1>,
           );
           return;
         }
@@ -398,7 +392,10 @@ const DocAI = () => {
         // Handle horizontal rules
         if (trimmedSection.match(/^[-*_]{3,}$/)) {
           formatted.push(
-            <hr key={`hr-${idx}`} className="my-6 border-t-2 border-gray-200" />
+            <hr
+              key={`hr-${idx}`}
+              className="my-6 border-t-2 border-gray-200"
+            />,
           );
           return;
         }
@@ -411,7 +408,7 @@ const DocAI = () => {
               className="border-l-4 border-blue-500 bg-blue-50 pl-5 py-3 pr-4 italic text-gray-700 my-4 rounded-r-lg"
             >
               {formatText(trimmedSection.replace(/^>\s*/, ""))}
-            </blockquote>
+            </blockquote>,
           );
           return;
         }
@@ -421,7 +418,7 @@ const DocAI = () => {
           formatted.push(
             <p key={`p-${idx}`} className="mb-3 leading-relaxed text-gray-800">
               {formatText(section)}
-            </p>
+            </p>,
           );
         } else {
           formatted.push(<div key={`br-${idx}`} className="h-2" />);
@@ -449,7 +446,7 @@ const DocAI = () => {
                 <span className="flex-1">{formatText(item)}</span>
               </li>
             ))}
-          </ListTag>
+          </ListTag>,
         );
       }
 

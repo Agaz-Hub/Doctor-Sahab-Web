@@ -8,79 +8,104 @@ import RelatedDoctors from "../components/RelatedDoctors";
 
 const Appointment = () => {
   const { docId } = useParams();
-  const { doctors, currencySymbol, backendUrl, token, getDoctorsData } =
-    useContext(AppContext);
+  const {
+    doctors,
+    currencySymbol,
+    backendUrl,
+    token,
+    getDoctorsData,
+    userData,
+  } = useContext(AppContext);
   const daysOfWeek = ["SUN", "MON", "TUE", "WED", "THU", "FRI", "SAT"];
+  const upcomingDaysCount = 7;
 
   const navigation = useNavigate();
 
   const [docInfo, setDocInfo] = useState(null);
-  const [docSlots, setDocSlots] = useState([]);
-  const [slotIndex, setSlotIndex] = useState(0);
-  const [slotTime, setSlotTime] = useState("");
+  const [upcomingDates, setUpcomingDates] = useState([]);
+  const [selectedDate, setSelectedDate] = useState("");
+  const [selectedShift, setSelectedShift] = useState("");
+  const [shiftAvailability, setShiftAvailability] = useState({});
+  const [dateShiftAvailability, setDateShiftAvailability] = useState({});
+  const [patientName, setPatientName] = useState("");
+  const [patientAge, setPatientAge] = useState("");
+  const [symptoms, setSymptoms] = useState("");
+  const [isLoadingShifts, setIsLoadingShifts] = useState(false);
+  const [isBooking, setIsBooking] = useState(false);
+
+  const buildUpcomingDates = (daysCount = upcomingDaysCount) => {
+    const today = new Date();
+    return Array.from({ length: daysCount }, (_, index) => {
+      const date = new Date(today);
+      date.setDate(today.getDate() + index);
+      const dateKey = `${date.getDate()}_${date.getMonth() + 1}_${date.getFullYear()}`;
+      return { date, dateKey };
+    });
+  };
+
+  const isPastDateKey = (dateKey) => {
+    if (!dateKey) return false;
+    const [day, month, year] = dateKey.split("_").map(Number);
+    if (!day || !month || !year) return false;
+    const date = new Date(year, month - 1, day);
+    const today = new Date();
+    today.setHours(0, 0, 0, 0);
+    date.setHours(0, 0, 0, 0);
+    return date < today;
+  };
 
   const fetchDocInfo = () => {
     const docInfo = doctors.find((doc) => doc._id === docId);
     setDocInfo(docInfo);
   };
 
-  const getAvailableSlot = async () => {
-    setDocSlots([]);
+  const fetchShiftAvailability = async (dateKey) => {
+    if (!docId || !dateKey) return;
+    setIsLoadingShifts(true);
 
-    // getting current date
-    let today = new Date();
+    try {
+      const { data } = await axios.get(
+        `${backendUrl}/api/doctors/${docId}/slots`,
+        { params: { date: dateKey } },
+      );
 
-    for (let i = 0; i < 7; i++) {
-      let currentDate = new Date(today);
-      currentDate.setDate(today.getDate() + i);
-
-      let endTime = new Date();
-      endTime.setDate(today.getDate() + i);
-      endTime.setHours(21, 0, 0, 0);
-
-      if (today.getDate() === currentDate.getDate()) {
-        currentDate.setHours(
-          currentDate.getHours() > 10 ? currentDate.getHours() + 1 : 10
-        );
-        currentDate.setMinutes(currentDate.getMinutes() > 30 ? 30 : 0);
+      if (data.success) {
+        const mapped = (data.shifts || []).reduce((acc, shift) => {
+          acc[shift.id] = shift;
+          return acc;
+        }, {});
+        setShiftAvailability(mapped);
+        setDateShiftAvailability((prev) => ({
+          ...prev,
+          [dateKey]: mapped,
+        }));
       } else {
-        currentDate.setHours(10);
-        currentDate.setMinutes(0);
+        setShiftAvailability({});
+        toast.error(data.message || "Failed to load shift availability");
       }
-
-      let timeSlots = [];
-
-      while (currentDate < endTime) {
-        let formattedTime = currentDate.toLocaleTimeString([], {
-          hour: "2-digit",
-          minute: "2-digit",
-        });
-
-        // Create date key for checking booked slots
-        let day = currentDate.getDate();
-        let month = currentDate.getMonth() + 1;
-        let year = currentDate.getFullYear();
-        const slotDate = day + "_" + month + "_" + year;
-
-        // Check if this slot is already booked
-        const isSlotBooked =
-          docInfo.slots_booked &&
-          docInfo.slots_booked[slotDate] &&
-          docInfo.slots_booked[slotDate].includes(formattedTime);
-
-        // Only add slot if it's not booked
-        if (!isSlotBooked) {
-          timeSlots.push({
-            datetime: new Date(currentDate),
-            time: formattedTime,
-          });
-        }
-
-        currentDate.setMinutes(currentDate.getMinutes() + 30);
-      }
-
-      setDocSlots((prev) => [...prev, timeSlots]);
+    } catch (error) {
+      console.error("Error fetching shifts:", error);
+      setShiftAvailability({});
+      toast.error(
+        error.response?.data?.message ||
+          "Error fetching shift availability. Please try again.",
+      );
+    } finally {
+      setIsLoadingShifts(false);
     }
+  };
+
+  const handleDateSelect = (dateKey) => {
+    setSelectedDate(dateKey);
+    setSelectedShift("");
+
+    const cached = dateShiftAvailability[dateKey];
+    if (cached) {
+      setShiftAvailability(cached);
+      return;
+    }
+
+    fetchShiftAvailability(dateKey);
   };
 
   const bookAppointment = async () => {
@@ -89,26 +114,45 @@ const Appointment = () => {
       return navigation("/login");
     }
 
-    if (!slotTime) {
-      return toast.error("Please select a slot time to book an appointment");
+    if (!selectedDate) {
+      return toast.error("Please select a date for the appointment");
+    }
+
+    if (!selectedShift) {
+      return toast.error("Please select a shift for the appointment");
+    }
+
+    if (shiftAvailability[selectedShift]?.isFull) {
+      return toast.error("Selected shift is full. Please choose another.");
+    }
+
+    const ageNumber = Number(patientAge);
+    if (
+      !patientName.trim() ||
+      !patientAge.trim() ||
+      Number.isNaN(ageNumber) ||
+      ageNumber <= 0 ||
+      !symptoms.trim()
+    ) {
+      return toast.error("Please enter patient name, age, and symptoms");
     }
 
     try {
-      const date = docSlots[slotIndex][0].datetime;
-
-      let day = date.getDate();
-      let month = date.getMonth() + 1;
-      let year = date.getFullYear();
-
-      const slotDate = day + "_" + month + "_" + year;
-
+      setIsBooking(true);
       const { data } = await axios.post(
-        backendUrl + "/api/user/book-appointment",
-        { docId, slotDate, slotTime },
-        { headers: { token } }
+        backendUrl + "/api/users/me/appointments",
+        {
+          docId,
+          slotDate: selectedDate,
+          shiftId: selectedShift,
+          patientName: patientName.trim(),
+          patientAge: ageNumber,
+          symptoms: symptoms.trim(),
+        },
+        { headers: { token } },
       );
       if (data.success) {
-        toast.success(data.message);
+        toast.success(data.message || "Appointment booked successfully");
         getDoctorsData();
         navigation("/my-appointments");
       } else {
@@ -118,8 +162,10 @@ const Appointment = () => {
       console.log(error);
       toast.error(
         error.response?.data?.message ||
-          "Error booking appointment. Please try again."
+          "Error booking appointment. Please try again.",
       );
+    } finally {
+      setIsBooking(false);
     }
   };
 
@@ -128,8 +174,31 @@ const Appointment = () => {
   }, [doctors, docId]);
 
   useEffect(() => {
-    getAvailableSlot();
+    if (!docInfo) return;
+    const dates = buildUpcomingDates();
+    setUpcomingDates(dates);
+    if (!selectedDate && dates[0]) {
+      setSelectedDate(dates[0].dateKey);
+    }
   }, [docInfo]);
+
+  useEffect(() => {
+    if (!docInfo || !selectedDate) return;
+
+    const cached = dateShiftAvailability[selectedDate];
+    if (cached) {
+      setShiftAvailability(cached);
+      return;
+    }
+
+    fetchShiftAvailability(selectedDate);
+  }, [docInfo, selectedDate]);
+
+  useEffect(() => {
+    if (userData?.name && !patientName) {
+      setPatientName(userData.name);
+    }
+  }, [userData, patientName]);
 
   return (
     docInfo && (
@@ -178,45 +247,108 @@ const Appointment = () => {
         <div className="sm:ml-72 sm:pl-4 mt-4 font-medium text-gray-700">
           <p>Booking Slots</p>
           <div className="flex gap-3 items-center w-full overflow-x-scroll mt-4">
-            {docSlots.length &&
-              docSlots.map((item, index) => (
+            {upcomingDates.length > 0 &&
+              upcomingDates.map((item, index) => (
                 <div
-                  onClick={() => setSlotIndex(index)}
+                  onClick={() => handleDateSelect(item.dateKey)}
                   className={`text-center py-6 min-w-16 rounded-full cursor-pointer ${
-                    slotIndex === index
+                    selectedDate === item.dateKey
                       ? "bg-primary text-white"
                       : "border border-gray-200"
                   }`}
                   key={index}
                 >
-                  <p>{item[0] && daysOfWeek[item[0].datetime.getDay()]}</p>
-                  <p>{item[0] && item[0].datetime.getDate()}</p>
+                  <p>{daysOfWeek[item.date.getDay()]}</p>
+                  <p>{item.date.getDate()}</p>
                 </div>
               ))}
           </div>
 
-          <div className="flex items-center gap-3 w-full overflow-x-scroll mt-4">
-            {docSlots.length &&
-              docSlots[slotIndex].map((item, index) => (
-                <p
-                  onClick={() => setSlotTime(item.time)}
-                  className={`text-sm font-light flex-shrink-0 px-5 py-2 rounded-full cursor-pointer ${
-                    item.time === slotTime
-                      ? "bg-primary text-white"
-                      : "text-gray-400 border border-gray-300"
-                  }`}
-                  key={index}
-                >
-                  {item.time.toLowerCase()}
-                </p>
-              ))}
+          <div className="mt-5">
+            <p className="text-sm text-gray-600">Select a shift</p>
+            <div className="flex flex-wrap gap-3 mt-3">
+              {(docInfo.shifts || []).map((shift) => {
+                const availability = shiftAvailability[shift.id];
+                const isFull = availability?.isFull;
+                const isDisabled =
+                  !selectedDate || isFull || isPastDateKey(selectedDate);
+
+                return (
+                  <button
+                    key={shift.id}
+                    onClick={() => setSelectedShift(shift.id)}
+                    disabled={isDisabled}
+                    className={`border rounded-xl px-4 py-3 text-left min-w-[180px] transition-all ${
+                      selectedShift === shift.id
+                        ? "border-primary bg-primary/10"
+                        : "border-gray-200"
+                    } ${isDisabled ? "opacity-50 cursor-not-allowed" : "hover:border-primary"}`}
+                  >
+                    <p className="text-sm font-medium text-gray-800">
+                      {shift.label}
+                    </p>
+                    <p className="text-xs text-gray-500">
+                      {shift.startTime} - {shift.endTime}
+                    </p>
+                    {isFull ? (
+                      <p className="text-xs text-red-500 mt-1">Full</p>
+                    ) : availability?.nextSlotTimeLabel ? (
+                      <p className="text-xs text-green-600 mt-1">
+                        Next: {availability.nextSlotTimeLabel}
+                      </p>
+                    ) : null}
+                  </button>
+                );
+              })}
+            </div>
+            {isLoadingShifts && (
+              <p className="text-xs text-gray-500 mt-2">Loading shifts...</p>
+            )}
+          </div>
+
+          <div className="mt-6 max-w-xl">
+            <p className="text-sm text-gray-600">Patient details</p>
+            <div className="grid gap-3 mt-3">
+              <div>
+                <p className="text-xs text-gray-500 mb-1">Patient Name</p>
+                <input
+                  className="border border-gray-300 rounded w-full p-2 text-sm"
+                  type="text"
+                  value={patientName}
+                  onChange={(e) => setPatientName(e.target.value)}
+                  placeholder="Enter patient name"
+                />
+              </div>
+              <div>
+                <p className="text-xs text-gray-500 mb-1">Patient Age</p>
+                <input
+                  className="border border-gray-300 rounded w-full p-2 text-sm"
+                  type="number"
+                  min="1"
+                  value={patientAge}
+                  onChange={(e) => setPatientAge(e.target.value)}
+                  placeholder="Enter age"
+                />
+              </div>
+              <div>
+                <p className="text-xs text-gray-500 mb-1">Symptoms</p>
+                <textarea
+                  className="border border-gray-300 rounded w-full p-2 text-sm"
+                  rows={3}
+                  value={symptoms}
+                  onChange={(e) => setSymptoms(e.target.value)}
+                  placeholder="Describe symptoms"
+                />
+              </div>
+            </div>
           </div>
 
           <button
             onClick={bookAppointment}
-            className="bg-primary text-white text-sm font-light px-14 py-3 rounded-full my-6"
+            disabled={isBooking}
+            className="bg-primary text-white text-sm font-light px-14 py-3 rounded-full my-6 disabled:opacity-60"
           >
-            Book an appointment
+            {isBooking ? "Booking..." : "Book an appointment"}
           </button>
         </div>
 
